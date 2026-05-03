@@ -8,7 +8,8 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 const port = process.env.PORT || 3001;
 app.use(cors({
-  origin: 'http://localhost:5173',
+  // Vite usa 5175 en crm-padel-frontend; 5173 por si otro script lo deja en el default
+  origin: ['http://localhost:5173', 'http://localhost:5175'],
   methods: ['GET', 'POST', 'DELETE', 'PUT'],
   allowedHeaders: ['Content-Type']
 }));
