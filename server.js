@@ -1,234 +1,216 @@
-// server.js
 require('dotenv').config();
+const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
-const { createClient } = require('@supabase/supabase-js');
-
+const cookieParser = require('cookie-parser');
+const { runQuery } = require('./src/query');
+const { requireUser, requireFreshRole } = require('./src/session');
+const { mountAuth } = require('./src/auth');
+const { mountProfesoresAuth } = require('./src/profesoresAuth');
+const { mountStorage } = require('./src/storage');
+const { mountDomainGrupos } = require('./src/domainGrupos');
+const { mountDomainCursos } = require('./src/domainCursos');
+const { mountDomainImportacion } = require('./src/domainImportacion');
+const { mountDomainFamilia } = require('./src/domainFamilia');
+const { mountDomainEventos } = require('./src/domainEventos');
+const { mountDomainInstalaciones } = require('./src/domainInstalaciones');
+const { mountDomainDeudas } = require('./src/domainDeudas');
+const { mountDomainClases } = require('./src/domainClases');
+const { mountDomainPagos } = require('./src/domainPagos');
+const { mountDomainAsistencias } = require('./src/domainAsistencias');
+const { mountDomainDashboard } = require('./src/domainDashboard');
+const { profesorPuede } = require('./src/authz');
+const { resolveProfesorScope, scopePlanForProfesor } = require('./src/profesorScope');
+const { query } = require('./src/db');
 
 const app = express();
-const port = process.env.PORT || 3001;
-app.use(cors({
-  // Vite usa 5175 en crm-padel-frontend; 5173 por si otro script lo deja en el default
-  origin: ['http://localhost:5173', 'http://localhost:5175'],
-  methods: ['GET', 'POST', 'DELETE', 'PUT'],
-  allowedHeaders: ['Content-Type']
-}));
+const port = Number(process.env.PORT || 3001);
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
 
-//Mideleware
-app.use(express.json());
+const CSP = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+  "img-src 'self' data: blob:",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src 'self' data: https://fonts.gstatic.com",
+  "script-src 'self'",
+  "worker-src 'self' blob:",
+  "connect-src 'self'",
+].join('; ');
 
-// Configura Supabase
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+app.use((req, res, next) => {
+  const requestId = req.get('x-request-id') || crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('X-Request-Id', requestId);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Strict-Transport-Security', 'max-age=15552000');
+  res.setHeader('Content-Security-Policy', process.env.CSP || CSP);
+  // Página / API de horarios familiares: token en URL → no caché, no referrer, no index.
+  if (
+    req.path.startsWith('/h/') ||
+    req.path.startsWith('/p/') ||
+    req.path.startsWith('/api/familia')
+  ) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+    res.setHeader('Pragma', 'no-cache');
+  } else {
+    res.setHeader('Referrer-Policy', 'same-origin');
+  }
+  next();
+});
 
-// Diagnóstico básico de entorno
-if (!supabaseUrl || !supabaseKey) {
-  console.error('[ENV] Faltan variables SUPABASE_URL o SUPABASE_KEY');
-} else {
-  console.log('[ENV] SUPABASE_URL y SUPABASE_KEY presentes');
+// Limitador en memoria: un solo contenedor, no hace falta estado compartido.
+function rateLimit({ windowMs, max }) {
+  const hits = new Map();
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = req.ip;
+    const entry = hits.get(key);
+    if (!entry || now > entry.reset) {
+      hits.set(key, { count: 1, reset: now + windowMs });
+    } else if (++entry.count > max) {
+      return res.status(429).json({ error: 'Demasiadas peticiones, prueba en un minuto' });
+    }
+    if (hits.size > 5000) {
+      for (const [k, v] of hits) if (now > v.reset) hits.delete(k);
+    }
+    return next();
+  };
 }
 
+const origins = (
+  process.env.CORS_ORIGINS ||
+  [
+    'http://localhost:5175',
+    'http://localhost:5173',
+    'http://localhost:4321',
+    'https://v3sports.es',
+    'https://www.v3sports.es',
+    'https://preview.v3sports.es',
+    'https://app.v3sports.es',
+  ].join(',')
+)
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
+app.use(
+  cors({
+    origin: origins,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+    allowedHeaders: ['Content-Type'],
+  })
+);
+app.use(express.json({ limit: '2mb' }));
+app.use(cookieParser());
 
-// Ruta de prueba
-app.get('/api/hello', (req, res) => {
-  res.json({ message: 'CRM de pádel funcionando 🎾' });
-});
-
-// Obtener todos los alumnos
-app.get('/api/alumnos', async (req, res) => {
-  const { data, error } = await supabase.from('alumnos').select('*');
-  if (error) {
-    console.error('[SUPABASE] Error en select alumnos:', error);
-    return res.status(500).json({ error: error.message });
+app.get('/api/health', async (_req, res) => {
+  try {
+    await query('SELECT 1');
+    res.json({ ok: true, service: 'crm-padel', db: 'ok' });
+  } catch (error) {
+    res.status(503).json({ ok: false, service: 'crm-padel', db: error.message });
   }
-  if (Array.isArray(data) && data.length === 0) {
-    console.warn('[SUPABASE] Select alumnos devolvió array vacío. Posibles causas: RLS bloquea SELECT, tabla vacía o nombre/esquema incorrecto.');
+});
+
+app.use('/api/auth/login', rateLimit({ windowMs: 60_000, max: 20 }));
+// Público con token en URL: límite más bajo por IP (vista previa WA + abuso).
+app.use('/api/familia', rateLimit({ windowMs: 60_000, max: 30 }));
+app.use('/api/public/eventos', rateLimit({ windowMs: 60_000, max: 60 }));
+app.use('/api/public/carteles', rateLimit({ windowMs: 60_000, max: 120 }));
+mountAuth(app);
+mountProfesoresAuth(app);
+mountDomainGrupos(app);
+mountDomainCursos(app);
+mountDomainImportacion(app);
+mountDomainFamilia(app);
+mountDomainEventos(app);
+mountDomainInstalaciones(app);
+mountDomainDeudas(app);
+mountDomainClases(app);
+mountDomainPagos(app);
+mountDomainAsistencias(app);
+mountDomainDashboard(app);
+mountStorage(app);
+
+app.post(
+  '/api/query',
+  rateLimit({ windowMs: 60_000, max: 600 }),
+  requireUser,
+  requireFreshRole,
+  async (req, res) => {
+  try {
+    let plan = req.body || {};
+    if (req.user.rol === 'profesor') {
+      const table = plan.table;
+      const op = plan.op;
+      if (!profesorPuede(table, op)) {
+        return res.status(403).json({
+          data: null,
+          error: { message: 'Esta consulta no está permitida para un profesor' },
+        });
+      }
+      const scope = await resolveProfesorScope(req.user.email);
+      plan = scopePlanForProfesor(plan, scope);
+    }
+    const result = await runQuery(plan);
+    res.json(result);
+  } catch (error) {
+    console.error(JSON.stringify({
+      level: 'error',
+      scope: 'query',
+      requestId: req.requestId,
+      message: error.message,
+    }));
+    const status = error.status === 403 ? 403 : 400;
+    res.status(status).json({
+      data: null,
+      error: { message: error.message || 'Error de consulta' },
+    });
   }
-  res.set('Cache-Control', 'no-store');
-  res.json(data);
 });
 
-//Endpoint alumno
-app.post('/api/alumnos', async (req, res) => {
-  const { nombre, email, telefono, nivel } = req.body;
-  if(!nombre || !telefono || !nivel) {
-    return res.status(400).json({ error: 'Faltan datos requeridos' });
-  }
-  const { data, error } = await supabase.from('alumnos').insert({ nombre, email, telefono, nivel:nivel ||'Iniciación (1)', activo:true });
-
-  if (error) {
-    console.error('[SUPABASE] Error en insert alumnos:', error);
-    return res.status(500).json({ error: error.message });
-  }
-  res.status(201).json({message: 'Alumno creado correctamente', data});
+const publicDir = process.env.PUBLIC_DIR || path.join(__dirname, 'public');
+const assetsDir = path.join(publicDir, 'assets');
+// Chunks con hash: caché larga. Si el hash no existe → 404 texto (no index.html).
+app.use(
+  '/assets',
+  express.static(assetsDir, {
+    maxAge: '365d',
+    immutable: true,
+  })
+);
+app.use('/assets', (_req, res) => {
+  res.status(404).type('text/plain').send('Asset no encontrado. Recarga la página.');
 });
-
-// PUT /api/alumnos/:id - Editar alumno
-app.put('/api/alumnos/:id', async (req, res) => {
-  const { id } = req.params;
-  const { nombre, email, telefono, nivel } = req.body;
-  const { data, error,count } = await supabase
-    .from('alumnos')
-    .update({ nombre, email, telefono, nivel })
-    .eq('id', id)
-    .select()
-    .maybeSingle();
-  if (error) return res.status(500).json({ error: error.message });
-  if (!data) return res.status(404).json({ error: 'Alumno no encontrado' });
-  res.json({ message: 'Alumno actualizado', data });
+app.use(express.static(publicDir, { index: false }));
+app.get(/^\/(?!api\/).*/, (req, res, next) => {
+  if (req.method !== 'GET') return next();
+  const index = path.join(publicDir, 'index.html');
+  // sendFile pisa Cache-Control si cacheControl queda en true (default → max-age=0).
+  res.sendFile(
+    index,
+    {
+      cacheControl: false,
+      headers: {
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+      },
+    },
+    err => {
+      if (err) next();
+    }
+  );
 });
-
-// DELETE /api/alumnos/:id - Eliminar alumno
-app.delete('/api/alumnos/:id', async (req, res) => {
-  const { id } = req.params;
-  const { error } = await supabase.from('alumnos').delete().eq('id', id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ message: 'Alumno eliminado' });
-});
-
-
-//Endpoint pagos
-app.get('/api/pagos', async (req, res) => {
-  const { data, error } = await supabase
-    .from('pagos')
-    .select(`id,cantidad,mes_cubierto,metodo,fecha_pago,alumno_id, alumnos(id,nombre)`)
-    .order('fecha_pago', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  const pagosConNombre = data.map(pago => ({
-    ...pago,
-    nombre_alumno: pago.alumnos?.nombre || 'Alumno eliminado'
-  }));
-  res.json(pagosConNombre);
-})
-
-app.post('/api/pagos', async (req, res) => {
-  const { alumno_id, cantidad, mes_cubierto, metodo, fecha_pago } = req.body;
-  if (!alumno_id || !cantidad || !mes_cubierto) {
-    return res.status(400).json({ error: 'Todos los campos son obligatorios' });
-  }
-  const { data, error } = await supabase
-    .from('pagos')
-    .insert([
-      { alumno_id, cantidad, mes_cubierto, metodo: metodo || 'Transferencia',fecha_pago }
-    ]);
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json({ message: 'Pago registrado', data });
-});
-
-// Endpoint clases
-
-app.get('/api/clases', async (req, res) => {
-  const { data, error } = await supabase
-    .from('clases')
-    .select('*')
-    .order('dia_semana');
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-// GET /api/alumnos-clases - Alumnos por clase
-app.get('/api/alumnos-clases', async (req, res) => {
-  const { data, error } = await supabase
-    .from('alumnos_clases')
-    .select(`
-      id,
-      alumno_id,
-      clase_id,
-      alumnos (nombre)
-    `);
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-// POST /api/clases - Crear clase
-app.post('/api/clases', async (req, res) => {
-  const { nombre, dia_semana, hora_inicio, hora_fin, nivel, profesor } = req.body;
-
-  if (!nombre || !dia_semana || !hora_inicio || !hora_fin || !nivel) {
-    return res.status(400).json({ error: 'Todos los campos obligatorios' });
-  }
-
-  const { data, error } = await supabase
-    .from('clases')
-    .insert([{ nombre, dia_semana, hora_inicio, hora_fin, nivel, profesor }]);
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json({ message: 'Clase creada', data });
-});
-
-// PUT /api/clases/:id - Editar clase
-app.put('/api/clases/:id', async (req, res) => {
-  const { id } = req.params;
-  const { nombre, dia_semana, hora_inicio, hora_fin, nivel, profesor } = req.body;
-
-  const { data, error } = await supabase
-    .from('clases')
-    .update({ nombre, dia_semana, hora_inicio, hora_fin, nivel, profesor })
-    .eq('id', id);
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ message: 'Clase actualizada', data });
-});
-
-// DELETE /api/clases/:id - Eliminar clase
-app.delete('/api/clases/:id', async (req, res) => {
-  const { id } = req.params;
-  const { error } = await supabase.from('clases').delete().eq('id', id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ message: 'Clase eliminada' });
-});
-
-
-//Endpoint asignación de alumnos
-
-// POST /api/asignar-alumno - Asignar alumno a clase
-app.post('/api/asignar-alumno', async (req, res) => {
-  const { alumno_id, clase_id } = req.body;
-  const { data, error } = await supabase
-    .from('alumnos_clases')
-    .insert([{ alumno_id, clase_id }]);
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json({ message: 'Alumno asignado' });
-});
-
-// DELETE /api/desasignar-alumno - Quitar alumno de clase
-app.delete('/api/desasignar-alumno/:alumno_id/:clase_id', async (req, res) => {
-  const { alumno_id, clase_id } = req.params;
-  const { error } = await supabase
-    .from('alumnos_clases')
-    .delete()
-    .eq('alumno_id', alumno_id)
-    .eq('clase_id', clase_id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ message: 'Alumno desasignado' });
-});
-
-
-//POST /api/asistencia -Registrar asistencia
-app.post('/api/asistencia', async (req, res) => {
-  const { alumno_id, clase_id, fecha, estado } = req.body;
-  const { data, error } = await supabase
-    .from('asistencias')
-    .insert([{ alumno_id, clase_id, fecha, estado }]);
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json({ message: 'Asistencia registrada' });
-});
-
-//GET /api/asistencia
-app.get('/api/asistencia', async (req, res) => {
-  const { fecha, alumno_id } = req.query;
-  let query = supabase.from('asistencias').select(`*,alumnos(nombre), clases(nombre)`);
-  if (fecha) query = query.eq('fecha', fecha);
-  if (alumno_id) query = query.eq('alumno_id', alumno_id);
-  const { data, error } = await query;
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-})
 
 app.listen(port, () => {
-  console.log(`Servidor corriendo en http://localhost:${port}`);
+  console.log(`CRM pádel API en http://localhost:${port}`);
 });

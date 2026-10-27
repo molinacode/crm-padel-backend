@@ -1,25 +1,26 @@
 {
   "name": "crm-padel-backend",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "version": "1.1.0",
+  "description": "API del CRM pádel: Postgres privado + sesión OIDC (Zitadel)",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test:authz": "node scripts/smoke-authz.js && node scripts/smoke-scope.js && node scripts/smoke-columns.js",
+    "test:telefono": "node scripts/smoke-telefono.js"
   },
-  "keywords": [],
-  "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@supabase/supabase-js": "^2.57.2",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^17.2.2",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "openid-client": "^5.7.1",
+    "pg": "^8.16.3"
   },
   "engines": {
     "node": ">=20 <23"
-  },
-  "packageManager": "pnpm@10.33.2"
+  }
 }
