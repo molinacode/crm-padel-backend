@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { query } = require('./db');
 const { requireAdmin } = require('./authz');
 const { normalizarTelefonoE164, nombrePila } = require('./telefono');
+const { calcularAlumnosConDeuda } = require('./domainDeudas');
 
 const TIPOS_ENLACE = new Set(['horario', 'pago']);
 
@@ -188,71 +189,307 @@ async function horariosPorTelefono(telefonoE164) {
   return [...byAlumno.values()];
 }
 
-async function pagosPorTelefono(telefonoE164) {
+function mesActualIso(fecha = new Date()) {
+  return `${fecha.getFullYear()}-${String(fecha.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function etiquetaMesIso(mes) {
+  const [year, month] = String(mes || '').split('-');
+  const y = Number(year);
+  const m = Number(month);
+  if (!y || !m) return etiquetaMesActual();
+  return etiquetaMesActual(new Date(y, m - 1, 1));
+}
+
+function precioDeMes(row, clasesMes) {
+  const modalidad = row.modalidad_cobro || null;
+  const precioClase = moneyOrNull(row.precio_clase);
+  const precioMes = moneyOrNull(row.precio_mes);
+  const iberdrola = row.iberdrola === true;
+  if (iberdrola) {
+    return {
+      importe: null,
+      nota: 'Convenio Iberdrola: el pago se gestiona por otras vías.',
+    };
+  }
+  if (modalidad === 'mensual') {
+    return {
+      importe: precioMes,
+      nota: precioMes == null ? 'Cuota mensual sin definir en ficha.' : null,
+    };
+  }
+  if (modalidad === 'turno_suelta') {
+    if (precioClase == null) {
+      return { importe: null, nota: 'Precio por clase sin definir en ficha.' };
+    }
+    return {
+      importe: Number((precioClase * clasesMes).toFixed(2)),
+      nota: `${clasesMes} clase(s) asistida(s) × ${precioClase.toFixed(2)} €`,
+    };
+  }
+  return {
+    importe: null,
+    nota: 'Modalidad de cobro sin definir en ficha (mensual o turno/clase suelta).',
+  };
+}
+
+async function alumnosActivosPorTelefono(telefonoE164) {
   const { rows } = await query(
     `
-    SELECT
-      a.id,
-      a.nombre,
-      a.modalidad_cobro,
-      a.iberdrola,
-      a.precio_clase,
-      a.precio_mes,
-      (
-        SELECT count(*)::int
-        FROM public.asistencias asis
-        WHERE asis.alumno_id = a.id
-          AND asis.estado = 'asistio'
-          AND asis.fecha >= date_trunc('month', CURRENT_DATE)::date
-          AND asis.fecha < (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
-      ) AS clases_asistidas_mes
-    FROM public.alumnos a
-    WHERE a.telefono_e164 = $1
-      AND COALESCE(a.activo, true) = true
-    ORDER BY a.nombre ASC NULLS LAST
+    SELECT id, nombre, modalidad_cobro, iberdrola, precio_clase, precio_mes
+    FROM public.alumnos
+    WHERE telefono_e164 = $1
+      AND COALESCE(activo, true) = true
+    ORDER BY nombre ASC NULLS LAST
     `,
     [telefonoE164]
   );
+  return rows;
+}
 
-  const mes = etiquetaMesActual();
-  return rows.map(row => {
-    const modalidad = row.modalidad_cobro || null;
-    const precioClase = moneyOrNull(row.precio_clase);
-    const precioMes = moneyOrNull(row.precio_mes);
-    const clasesMes = Number(row.clases_asistidas_mes || 0);
-    const iberdrola = row.iberdrola === true;
-
-    let precioMesCurso = null;
-    let precioMesCursoNota = null;
-    if (iberdrola) {
-      precioMesCursoNota =
-        'Convenio Iberdrola: el pago se gestiona por otras vías.';
-    } else if (modalidad === 'mensual') {
-      precioMesCurso = precioMes;
-      precioMesCursoNota = precioMes == null ? 'Cuota mensual sin definir en ficha.' : null;
-    } else if (modalidad === 'turno_suelta') {
-      if (precioClase != null) {
-        precioMesCurso = Number((precioClase * clasesMes).toFixed(2));
-        precioMesCursoNota = `${clasesMes} clase(s) asistida(s) este mes × ${precioClase.toFixed(2)} €`;
-      } else {
-        precioMesCursoNota = 'Precio por clase sin definir en ficha.';
-      }
-    } else {
-      precioMesCursoNota =
-        'Modalidad de cobro sin definir en ficha (mensual o turno/clase suelta).';
+async function impagadosPorAlumno(ids) {
+  const map = new Map();
+  if (!ids.length) return map;
+  try {
+    const { alumnos } = await calcularAlumnosConDeuda();
+    const querer = new Set(ids.map(String));
+    for (const alumno of alumnos) {
+      if (!querer.has(String(alumno.id))) continue;
+      map.set(
+        String(alumno.id),
+        (alumno.meses || []).map(m => String(m.mes)).filter(m => /^\d{4}-\d{2}$/.test(m))
+      );
     }
+  } catch (error) {
+    console.error('[familia] meses impagados', error);
+  }
+  return map;
+}
 
-    return {
-      nombre: nombrePila(row.nombre),
-      modalidad_cobro: modalidad,
-      iberdrola,
-      precio_clase: precioClase,
-      precio_mes: precioMes,
-      clases_asistidas_mes: clasesMes,
-      precio_mes_curso: precioMesCurso,
-      precio_mes_curso_nota: precioMesCursoNota,
-      mes_etiqueta: mes,
-    };
+async function clasesAsistidasPorMes(ids, meses) {
+  const map = new Map();
+  if (!ids.length || !meses.length) return map;
+  const { rows } = await query(
+    `
+    SELECT alumno_id::text AS alumno_id,
+           to_char(fecha, 'YYYY-MM') AS mes,
+           count(*)::int AS n
+    FROM public.asistencias
+    WHERE alumno_id = ANY($1::uuid[])
+      AND estado = 'asistio'
+      AND to_char(fecha, 'YYYY-MM') = ANY($2::text[])
+    GROUP BY 1, 2
+    `,
+    [ids, meses]
+  );
+  for (const row of rows) {
+    map.set(`${row.alumno_id}|${row.mes}`, Number(row.n || 0));
+  }
+  return map;
+}
+
+function parseMesesPagoGuardados(raw) {
+  if (!raw) return null;
+  const list = Array.isArray(raw) ? raw : [];
+  const map = new Map();
+  for (const item of list) {
+    const id = String(item?.alumno_id || '');
+    if (!id) continue;
+    const meses = new Set(
+      (item.meses || [])
+        .map(m => String(m || '').slice(0, 7))
+        .filter(m => /^\d{4}-\d{2}$/.test(m))
+    );
+    map.set(id, meses);
+  }
+  return map;
+}
+
+async function mesesGuardadosPorTelefono(telefonoE164) {
+  const { rows } = await query(
+    `
+    SELECT meses_pago
+    FROM public.familia_enlaces
+    WHERE telefono_e164 = $1
+      AND tipo = 'pago'
+      AND revoked_at IS NULL
+      AND (expires_at IS NULL OR expires_at > now())
+    LIMIT 1
+    `,
+    [telefonoE164]
+  );
+  if (!rows[0]) return null;
+  return parseMesesPagoGuardados(rows[0].meses_pago);
+}
+
+/** Meses que el staff puede marcar: impagados + mes en curso + lo ya guardado. */
+async function vistaMesesPago(telefonoE164) {
+  const alumnos = await alumnosActivosPorTelefono(telefonoE164);
+  const ids = alumnos.map(a => String(a.id));
+  const impagados = await impagadosPorAlumno(ids);
+  const guardados = await mesesGuardadosPorTelefono(telefonoE164);
+  const actual = mesActualIso();
+  const universo = new Set([actual]);
+  for (const id of ids) {
+    for (const mes of impagados.get(id) || []) universo.add(mes);
+    const saved = guardados?.get(id);
+    if (saved) {
+      for (const mes of saved) {
+        if (mes <= actual) universo.add(mes);
+      }
+    }
+  }
+  const clases = await clasesAsistidasPorMes(ids, [...universo]);
+
+  return {
+    guardado: Boolean(guardados),
+    alumnos: alumnos.map(row => {
+      const id = String(row.id);
+      const imp = new Set(impagados.get(id) || []);
+      const saved = guardados?.get(id);
+      const mesesSet = new Set([actual, ...imp]);
+      if (saved) {
+        for (const mes of saved) {
+          if (mes <= actual) mesesSet.add(mes);
+        }
+      }
+      const meses = [...mesesSet].sort().map(mes => {
+        const clasesN = clases.get(`${id}|${mes}`) || 0;
+        const precio = precioDeMes(row, clasesN);
+        let seleccionado = false;
+        if (saved) seleccionado = saved.has(mes);
+        else if (imp.has(mes)) seleccionado = true;
+        else seleccionado = imp.size === 0 && mes === actual;
+        return {
+          mes,
+          etiqueta: etiquetaMesIso(mes),
+          impagado: imp.has(mes),
+          actual: mes === actual,
+          clases_asistidas: clasesN,
+          importe: precio.importe,
+          nota: precio.nota,
+          seleccionado,
+        };
+      });
+      return {
+        id,
+        nombre: row.nombre,
+        modalidad_cobro: row.modalidad_cobro || null,
+        iberdrola: row.iberdrola === true,
+        meses,
+      };
+    }),
+  };
+}
+
+function normalizarSeleccionMeses(raw, idsPermitidos) {
+  if (!Array.isArray(raw)) return null;
+  const permitidos = new Set(idsPermitidos.map(String));
+  const actual = mesActualIso();
+  const out = [];
+  for (const item of raw) {
+    const id = String(item?.alumno_id || item?.id || '');
+    if (!permitidos.has(id)) continue;
+    const vistos = new Set();
+    const meses = [];
+    for (const value of item.meses || []) {
+      const mes = String(value || '').slice(0, 7);
+      if (!/^\d{4}-\d{2}$/.test(mes) || mes > actual || vistos.has(mes)) continue;
+      vistos.add(mes);
+      meses.push(mes);
+      if (meses.length >= 24) break;
+    }
+    meses.sort();
+    out.push({ alumno_id: id, meses });
+  }
+  return out;
+}
+
+async function seleccionPorDefecto(telefonoE164) {
+  const vista = await vistaMesesPago(telefonoE164);
+  return vista.alumnos.map(alumno => ({
+    alumno_id: alumno.id,
+    meses: alumno.meses.filter(m => m.seleccionado).map(m => m.mes),
+  }));
+}
+
+async function guardarMesesPago(enlaceId, seleccion) {
+  await query(
+    `UPDATE public.familia_enlaces SET meses_pago = $2::jsonb WHERE id = $1`,
+    [enlaceId, JSON.stringify(seleccion)]
+  );
+}
+
+function lineaAlumnoPago(row, mesesLineas) {
+  const modalidad = row.modalidad_cobro || null;
+  const precioClase = moneyOrNull(row.precio_clase);
+  const precioMes = moneyOrNull(row.precio_mes);
+  const iberdrola = row.iberdrola === true;
+  const importes = mesesLineas
+    .map(m => m.importe)
+    .filter(n => typeof n === 'number' && Number.isFinite(n));
+  const total = importes.length
+    ? Number(importes.reduce((acc, n) => acc + n, 0).toFixed(2))
+    : null;
+  const primera = mesesLineas[0];
+  const etiqueta =
+    mesesLineas.length > 1
+      ? mesesLineas.map(m => m.etiqueta).join(', ')
+      : primera?.etiqueta || etiquetaMesActual();
+  return {
+    nombre: nombrePila(row.nombre),
+    modalidad_cobro: modalidad,
+    iberdrola,
+    precio_clase: precioClase,
+    precio_mes: precioMes,
+    clases_asistidas_mes: primera?.clases_asistidas || 0,
+    precio_mes_curso: total,
+    precio_mes_curso_nota:
+      mesesLineas.length === 1 ? primera?.nota || null : null,
+    mes_etiqueta: etiqueta,
+    meses: mesesLineas.map(m => ({
+      mes: m.mes,
+      etiqueta: m.etiqueta,
+      importe: m.importe,
+      nota: m.nota,
+    })),
+    total,
+  };
+}
+
+async function pagosPorTelefono(telefonoE164, mesesPago) {
+  const rows = await alumnosActivosPorTelefono(telefonoE164);
+  const ids = rows.map(a => String(a.id));
+  const actual = mesActualIso();
+  const guardados = parseMesesPagoGuardados(mesesPago);
+  const porAlumno = new Map();
+  if (guardados) {
+    for (const [id, meses] of guardados) porAlumno.set(id, [...meses].sort());
+  } else {
+    for (const id of ids) porAlumno.set(id, [actual]);
+  }
+
+  const universo = new Set();
+  for (const meses of porAlumno.values()) {
+    for (const mes of meses) universo.add(mes);
+  }
+  const clases = await clasesAsistidasPorMes(ids, [...universo]);
+
+  return rows.map(row => {
+    const id = String(row.id);
+    const meses = porAlumno.get(id) || [];
+    const lineas = meses.map(mes => {
+      const clasesN = clases.get(`${id}|${mes}`) || 0;
+      const precio = precioDeMes(row, clasesN);
+      return {
+        mes,
+        etiqueta: etiquetaMesIso(mes),
+        clases_asistidas: clasesN,
+        importe: precio.importe,
+        nota: precio.nota,
+      };
+    });
+    return lineaAlumnoPago(row, lineas);
   });
 }
 
@@ -304,7 +541,7 @@ async function asegurarEnlace(telefonoE164, tipo, { regenerar = false } = {}) {
 /** Token activo y no caducado; mismo 404 si no existe / revocado / expirado. */
 async function enlacePublicoPorToken(token, tipo) {
   const { rows } = await query(
-    `SELECT id, telefono_e164, expires_at
+    `SELECT id, telefono_e164, expires_at, meses_pago
      FROM public.familia_enlaces
      WHERE token = $1 AND tipo = $2 AND revoked_at IS NULL
      LIMIT 1`,
@@ -416,6 +653,25 @@ function mountDomainFamilia(app) {
     }
   });
 
+  app.get('/api/familia/pago-meses', requireAdmin, async (req, res) => {
+    try {
+      const alumnoId = String(req.query?.alumnoId || '');
+      if (!alumnoId) {
+        return res.status(400).json({ error: 'alumnoId es obligatorio' });
+      }
+      const info = await telefonoDeAlumno(alumnoId);
+      if (!info) return res.status(404).json({ error: 'Alumno no encontrado' });
+      if (!info.e164) {
+        return res.json({ telefono_e164: null, guardado: false, alumnos: [] });
+      }
+      const vista = await vistaMesesPago(info.e164);
+      return res.json({ telefono_e164: info.e164, ...vista });
+    } catch (error) {
+      console.error('[familia] pago-meses', error);
+      res.status(500).json({ error: error.message || 'Error' });
+    }
+  });
+
   app.post('/api/familia/enlace', requireAdmin, async (req, res) => {
     try {
       const alumnoId = String(req.body?.alumnoId || '');
@@ -435,7 +691,24 @@ function mountDomainFamilia(app) {
           error: 'El alumno no tiene un teléfono válido (móvil ES o E.164).',
         });
       }
+      let seleccionPago = null;
+      if (tipo === 'pago') {
+        const alumnos = await alumnosActivosPorTelefono(info.e164);
+        const ids = alumnos.map(a => String(a.id));
+        seleccionPago = normalizarSeleccionMeses(req.body?.meses, ids);
+        if (!seleccionPago) seleccionPago = await seleccionPorDefecto(info.e164);
+        const hayMes = seleccionPago.some(item => item.meses.length > 0);
+        const hayCobro = alumnos.some(a => a.iberdrola !== true);
+        if (hayCobro && !hayMes) {
+          return res.status(400).json({
+            error: 'Elige al menos un mes para el enlace de pago.',
+          });
+        }
+      }
       let enlace = await asegurarEnlace(info.e164, tipo, { regenerar });
+      if (seleccionPago) {
+        await guardarMesesPago(enlace.id, seleccionPago);
+      }
       if (notificar) {
         enlace = (await marcarNotificado(enlace.id)) || enlace;
       }
@@ -545,11 +818,19 @@ function mountDomainFamilia(app) {
         `UPDATE public.familia_enlaces SET last_used_at = now() WHERE id = $1`,
         [enlace.id]
       );
-      const alumnos = await pagosPorTelefono(enlace.telefono_e164);
+      const alumnos = await pagosPorTelefono(
+        enlace.telefono_e164,
+        enlace.meses_pago
+      );
       const revelar = puedeRevelarMetodosPago(alumnos);
+      const etiquetas = [
+        ...new Set(
+          alumnos.flatMap(a => (a.meses || []).map(m => m.etiqueta)).filter(Boolean)
+        ),
+      ];
       res.json({
         alumnos,
-        mes_etiqueta: etiquetaMesActual(),
+        mes_etiqueta: etiquetas.join(', ') || etiquetaMesActual(),
         // Métodos solo vía GET .../metodos (segundo paso explícito).
         metodos: null,
         mostrar_metodos: revelar,
@@ -572,7 +853,10 @@ function mountDomainFamilia(app) {
       if (!enlace) {
         return res.status(404).json({ error: 'Enlace no válido' });
       }
-      const alumnos = await pagosPorTelefono(enlace.telefono_e164);
+      const alumnos = await pagosPorTelefono(
+        enlace.telefono_e164,
+        enlace.meses_pago
+      );
       if (!puedeRevelarMetodosPago(alumnos)) {
         return res.status(404).json({ error: 'Enlace no válido' });
       }
