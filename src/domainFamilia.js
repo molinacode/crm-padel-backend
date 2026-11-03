@@ -201,7 +201,12 @@ function etiquetaMesIso(mes) {
   return etiquetaMesActual(new Date(y, m - 1, 1));
 }
 
-function precioDeMes(row, clasesMes) {
+function formatoImporte(n) {
+  return String(n).replace('.', ',');
+}
+
+/** 4 semanas = precio_mes de la ficha. Un mes corto se prorratea. */
+function precioDeMes(row, clasesMes, cuota) {
   const modalidad = row.modalidad_cobro || null;
   const precioClase = moneyOrNull(row.precio_clase);
   const precioMes = moneyOrNull(row.precio_mes);
@@ -213,10 +218,23 @@ function precioDeMes(row, clasesMes) {
     };
   }
   if (modalidad === 'mensual') {
-    return {
-      importe: precioMes,
-      nota: precioMes == null ? 'Cuota mensual sin definir en ficha.' : null,
-    };
+    if (precioMes == null) {
+      return { importe: null, nota: 'Cuota mensual sin definir en ficha.' };
+    }
+    const semanasRaw = cuota && cuota.semanas != null ? Number(cuota.semanas) : 4;
+    const semanas = Number.isFinite(semanasRaw) && semanasRaw >= 0 ? semanasRaw : 4;
+    const importe = Number(((precioMes * semanas) / 4).toFixed(2));
+    const partes = [];
+    if (semanas !== 4) {
+      partes.push(
+        `${formatoImporte(semanas)} semanas de clase · mes completo ${formatoImporte(precioMes)} €`
+      );
+    }
+    if (cuota && cuota.dias_clase != null && cuota.dias_clase !== '') {
+      partes.push(`${cuota.dias_clase} días de clase`);
+    }
+    if (cuota && cuota.nota) partes.push(String(cuota.nota));
+    return { importe, nota: partes.length ? partes.join(' · ') : null };
   }
   if (modalidad === 'turno_suelta') {
     if (precioClase == null) {
@@ -262,6 +280,30 @@ async function impagadosPorAlumno(ids) {
     }
   } catch (error) {
     console.error('[familia] meses impagados', error);
+  }
+  return map;
+}
+
+async function cuotasPorMes(meses) {
+  const map = new Map();
+  if (!meses.length) return map;
+  try {
+    const { rows } = await query(
+      `
+      SELECT cm.mes, cm.semanas, cm.dias_clase, cm.nota
+      FROM public.cuotas_mes cm
+      JOIN public.cursos cu ON cu.id = cm.curso_id
+      WHERE cm.mes = ANY($1::text[])
+      ORDER BY CASE WHEN cu.estado = 'abierto' THEN 0 ELSE 1 END,
+               cu.fecha_inicio DESC
+      `,
+      [meses]
+    );
+    for (const row of rows) {
+      if (!map.has(row.mes)) map.set(row.mes, row);
+    }
+  } catch (error) {
+    console.error('[familia] cuotas_mes', error);
   }
   return map;
 }
@@ -339,7 +381,9 @@ async function vistaMesesPago(telefonoE164) {
       }
     }
   }
-  const clases = await clasesAsistidasPorMes(ids, [...universo]);
+  const mesesLista = [...universo];
+  const clases = await clasesAsistidasPorMes(ids, mesesLista);
+  const cuotas = await cuotasPorMes(mesesLista);
 
   return {
     guardado: Boolean(guardados),
@@ -355,7 +399,7 @@ async function vistaMesesPago(telefonoE164) {
       }
       const meses = [...mesesSet].sort().map(mes => {
         const clasesN = clases.get(`${id}|${mes}`) || 0;
-        const precio = precioDeMes(row, clasesN);
+        const precio = precioDeMes(row, clasesN, cuotas.get(mes));
         let seleccionado = false;
         if (saved) seleccionado = saved.has(mes);
         else if (imp.has(mes)) seleccionado = true;
@@ -473,14 +517,16 @@ async function pagosPorTelefono(telefonoE164, mesesPago) {
   for (const meses of porAlumno.values()) {
     for (const mes of meses) universo.add(mes);
   }
-  const clases = await clasesAsistidasPorMes(ids, [...universo]);
+  const mesesLista = [...universo];
+  const clases = await clasesAsistidasPorMes(ids, mesesLista);
+  const cuotas = await cuotasPorMes(mesesLista);
 
   return rows.map(row => {
     const id = String(row.id);
     const meses = porAlumno.get(id) || [];
     const lineas = meses.map(mes => {
       const clasesN = clases.get(`${id}|${mes}`) || 0;
-      const precio = precioDeMes(row, clasesN);
+      const precio = precioDeMes(row, clasesN, cuotas.get(mes));
       return {
         mes,
         etiqueta: etiquetaMesIso(mes),

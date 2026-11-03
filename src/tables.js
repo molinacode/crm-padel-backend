@@ -6,6 +6,7 @@ const ALLOWED_TABLES = new Set([
   'asistencias',
   'clases',
   'cursos',
+  'cuotas_mes',
   'clases_ejercicios',
   'ejercicios',
   'eventos_clase',
@@ -149,6 +150,9 @@ const WRITABLE_COLUMNS = {
     'updated_at',
   ]),
   cursos: new Set(['id', 'nombre', 'fecha_inicio', 'fecha_fin', 'estado', 'created_at']),
+  cuotas_mes: new Set([
+    'id', 'curso_id', 'mes', 'semanas', 'dias_clase', 'nota', 'updated_at',
+  ]),
   ejercicios: new Set([
     'id', 'nombre', 'description', 'categoria', 'dificultad', 'duracion_minutos', 'tipo',
     'material_necesario', 'instrucciones', 'variantes', 'observaciones', 'created_at',
