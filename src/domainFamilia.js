@@ -251,13 +251,13 @@ function precioDeMes(row, clasesMes, cuota) {
   };
 }
 
-async function alumnosActivosPorTelefono(telefonoE164) {
+async function alumnosCobroPorTelefono(telefonoE164) {
   const { rows } = await query(
     `
-    SELECT id, nombre, modalidad_cobro, iberdrola, precio_clase, precio_mes
+    SELECT id, nombre, modalidad_cobro, iberdrola, precio_clase, precio_mes,
+           COALESCE(activo, true) AS activo
     FROM public.alumnos
     WHERE telefono_e164 = $1
-      AND COALESCE(activo, true) = true
     ORDER BY nombre ASC NULLS LAST
     `,
     [telefonoE164]
@@ -366,7 +366,7 @@ async function mesesGuardadosPorTelefono(telefonoE164) {
 
 /** Meses que el staff puede marcar: impagados + mes en curso + lo ya guardado. */
 async function vistaMesesPago(telefonoE164) {
-  const alumnos = await alumnosActivosPorTelefono(telefonoE164);
+  const alumnos = await alumnosCobroPorTelefono(telefonoE164);
   const ids = alumnos.map(a => String(a.id));
   const impagados = await impagadosPorAlumno(ids);
   const guardados = await mesesGuardadosPorTelefono(telefonoE164);
@@ -391,7 +391,9 @@ async function vistaMesesPago(telefonoE164) {
       const id = String(row.id);
       const imp = new Set(impagados.get(id) || []);
       const saved = guardados?.get(id);
-      const mesesSet = new Set([actual, ...imp]);
+      const activo = row.activo !== false;
+      const mesesSet = new Set(imp);
+      if (activo) mesesSet.add(actual);
       if (saved) {
         for (const mes of saved) {
           if (mes <= actual) mesesSet.add(mes);
@@ -418,11 +420,12 @@ async function vistaMesesPago(telefonoE164) {
       return {
         id,
         nombre: row.nombre,
+        activo,
         modalidad_cobro: row.modalidad_cobro || null,
         iberdrola: row.iberdrola === true,
         meses,
       };
-    }),
+    }).filter(alumno => alumno.activo !== false || alumno.meses.length > 0),
   };
 }
 
@@ -502,7 +505,7 @@ function lineaAlumnoPago(row, mesesLineas) {
 }
 
 async function pagosPorTelefono(telefonoE164, mesesPago) {
-  const rows = await alumnosActivosPorTelefono(telefonoE164);
+  const rows = await alumnosCobroPorTelefono(telefonoE164);
   const ids = rows.map(a => String(a.id));
   const actual = mesActualIso();
   const guardados = parseMesesPagoGuardados(mesesPago);
@@ -510,7 +513,10 @@ async function pagosPorTelefono(telefonoE164, mesesPago) {
   if (guardados) {
     for (const [id, meses] of guardados) porAlumno.set(id, [...meses].sort());
   } else {
-    for (const id of ids) porAlumno.set(id, [actual]);
+    for (const row of rows) {
+      if (row.activo === false) continue;
+      porAlumno.set(String(row.id), [actual]);
+    }
   }
 
   const universo = new Set();
@@ -521,9 +527,10 @@ async function pagosPorTelefono(telefonoE164, mesesPago) {
   const clases = await clasesAsistidasPorMes(ids, mesesLista);
   const cuotas = await cuotasPorMes(mesesLista);
 
-  return rows.map(row => {
+  return rows.flatMap(row => {
     const id = String(row.id);
     const meses = porAlumno.get(id) || [];
+    if (!meses.length) return [];
     const lineas = meses.map(mes => {
       const clasesN = clases.get(`${id}|${mes}`) || 0;
       const precio = precioDeMes(row, clasesN, cuotas.get(mes));
@@ -535,7 +542,7 @@ async function pagosPorTelefono(telefonoE164, mesesPago) {
         nota: precio.nota,
       };
     });
-    return lineaAlumnoPago(row, lineas);
+    return [lineaAlumnoPago(row, lineas)];
   });
 }
 
@@ -739,7 +746,7 @@ function mountDomainFamilia(app) {
       }
       let seleccionPago = null;
       if (tipo === 'pago') {
-        const alumnos = await alumnosActivosPorTelefono(info.e164);
+        const alumnos = await alumnosCobroPorTelefono(info.e164);
         const ids = alumnos.map(a => String(a.id));
         seleccionPago = normalizarSeleccionMeses(req.body?.meses, ids);
         if (!seleccionPago) seleccionPago = await seleccionPorDefecto(info.e164);

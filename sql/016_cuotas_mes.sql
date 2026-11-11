@@ -23,3 +23,13 @@ comment on column public.cuotas_mes.dias_clase is
   'Días hábiles de clase del mes. Informativo; el importe sale de las semanas.';
 comment on column public.cuotas_mes.nota is
   'Vacaciones o puente que explica un mes más corto.';
+
+-- El script a veces lo ejecuta el superusuario del contenedor. Sin esto,
+-- crm_padel recibe "permission denied for table cuotas_mes".
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'crm_padel') then
+    alter table public.cuotas_mes owner to crm_padel;
+  end if;
+end
+$$;
