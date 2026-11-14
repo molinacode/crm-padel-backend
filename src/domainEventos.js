@@ -1,6 +1,7 @@
 const fs = require('fs');
+const crypto = require('crypto');
 const { query, withClient } = require('./db');
-const { requireAdmin } = require('./authz');
+const { requireAdmin, requireStaff } = require('./authz');
 const { requireUser } = require('./session');
 const { normalizarTelefonoE164 } = require('./telefono');
 const { cartelPublicUrl, uploadCartel, resolveCartel } = require('./storage');
@@ -10,6 +11,7 @@ const ESTADOS_INSCRIPCION = new Set([
   'revisado',
   'confirmado',
   'pagado',
+  'espera',
   'rechazado',
 ]);
 
@@ -143,7 +145,14 @@ async function listEdicionesAdmin() {
             t.theme AS tipo_theme,
             t.color AS tipo_color,
             t.accent AS tipo_accent,
-            (SELECT count(*)::int FROM evento_inscripciones i WHERE i.edicion_id = e.id) AS inscritos,
+            (SELECT count(*)::int FROM evento_inscripciones i
+              WHERE i.edicion_id = e.id AND i.estado NOT IN ('rechazado','espera')) AS inscritos,
+            (SELECT count(*)::int FROM evento_inscripciones i
+              WHERE i.edicion_id = e.id AND i.estado = 'espera') AS en_espera,
+            (SELECT count(*)::int FROM evento_inscripciones i
+              WHERE i.edicion_id = e.id AND i.importe_pagado_centimos IS NOT NULL) AS pagados,
+            (SELECT coalesce(sum(i.importe_pagado_centimos),0)::int FROM evento_inscripciones i
+              WHERE i.edicion_id = e.id) AS cobrado_centimos,
             (SELECT count(*)::int FROM evento_inscripciones i
               WHERE i.edicion_id = e.id AND i.estado = 'nuevo') AS inscritos_nuevos
      FROM evento_ediciones e
@@ -257,9 +266,214 @@ async function resolverPistaNombre(instalacionId, pistaNombre) {
   return rows[0]?.nombre || null;
 }
 
+/** Registra un hecho del evento. Nunca rompe la operación principal. */
+async function registrarBitacora(db, edicionId, tipo, descripcion, datos, req) {
+  try {
+    const run = db ? db.query.bind(db) : query;
+    await run(
+      `INSERT INTO evento_bitacora
+         (edicion_id, tipo, descripcion, datos, actor_email, actor_rol)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        edicionId,
+        tipo,
+        descripcion,
+        JSON.stringify(datos || {}),
+        req?.user?.email || null,
+        req?.user?.rol || (req ? 'publico' : null),
+      ]
+    );
+  } catch (error) {
+    console.error('[eventos] bitacora', error.message);
+  }
+}
+
+async function alumnoIdPorTelefono(db, telefonoE164) {
+  if (!telefonoE164) return null;
+  const run = db ? db.query.bind(db) : query;
+  const { rows } = await run(
+    `SELECT id FROM alumnos WHERE telefono_e164 = $1 LIMIT 1`,
+    [telefonoE164]
+  );
+  return rows[0]?.id || null;
+}
+
+/**
+ * Inserta una inscripción dentro de una TX abierta. Si el aforo está completo,
+ * entra en lista de espera (salvo forzar). Enlaza alumno_id por teléfono.
+ */
+async function insertarInscripcion(
+  client,
+  edicionId,
+  { nombre, apellidos, telefono, nivel, payload, estado },
+  { forzar = false, requireAbierta = false } = {}
+) {
+  const lock = await client.query(
+    `SELECT id, aforo, inscripcion_abierta
+     FROM evento_ediciones WHERE id = $1 FOR UPDATE`,
+    [edicionId]
+  );
+  const ed = lock.rows[0];
+  if (!ed) {
+    const err = new Error('Evento no encontrado');
+    err.status = 404;
+    throw err;
+  }
+  if (requireAbierta && !ed.inscripcion_abierta) {
+    const err = new Error('Inscripción cerrada');
+    err.status = 403;
+    throw err;
+  }
+  let estadoFinal = estado || 'nuevo';
+  let listaEspera = false;
+  if (ed.aforo != null && !forzar && estadoFinal !== 'rechazado') {
+    const count = await client.query(
+      `SELECT count(*)::int AS n FROM evento_inscripciones
+       WHERE edicion_id = $1 AND estado NOT IN ('rechazado','espera')`,
+      [edicionId]
+    );
+    if (count.rows[0].n >= ed.aforo) {
+      estadoFinal = 'espera';
+      listaEspera = true;
+    }
+  }
+  const alumnoId = await alumnoIdPorTelefono(client, telefono);
+  const inserted = await client.query(
+    `INSERT INTO evento_inscripciones
+       (edicion_id, nombre, apellidos, telefono_e164, nivel, payload, estado, alumno_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     RETURNING *`,
+    [
+      edicionId,
+      nombre,
+      apellidos,
+      telefono,
+      nivel || null,
+      JSON.stringify(payload || {}),
+      estadoFinal,
+      alumnoId,
+    ]
+  );
+  return { row: inserted.rows[0], listaEspera };
+}
+
+function formatEuros(centimos) {
+  if (centimos == null) return '—';
+  return `${(centimos / 100).toFixed(2).replace('.', ',')} €`;
+}
+
+function nuevoToken() {
+  return crypto.randomBytes(8).toString('hex');
+}
+
+function ganadorDeResultado(m) {
+  if (m.ganador) return m.ganador;
+  if (m.sets_a > m.sets_b) return 'a';
+  if (m.sets_b > m.sets_a) return 'b';
+  return 'empate';
+}
+
+async function computarClasificacion(edicionId) {
+  const [insc, res] = await Promise.all([
+    query(
+      `SELECT id, nombre, apellidos, nivel
+       FROM evento_inscripciones
+       WHERE edicion_id = $1 AND estado <> 'rechazado'`,
+      [edicionId]
+    ),
+    query(`SELECT * FROM evento_resultados WHERE edicion_id = $1`, [edicionId]),
+  ]);
+  const tabla = new Map();
+  for (const i of insc.rows) {
+    tabla.set(i.id, {
+      inscripcion_id: i.id,
+      nombre: i.nombre,
+      apellidos: i.apellidos,
+      nivel: i.nivel,
+      pj: 0,
+      pg: 0,
+      pe: 0,
+      pp: 0,
+      sf: 0,
+      sc: 0,
+      jf: 0,
+      jc: 0,
+      puntos: 0,
+    });
+  }
+  for (const m of res.rows) {
+    const a = tabla.get(m.inscripcion_a);
+    const b = tabla.get(m.inscripcion_b);
+    const g = ganadorDeResultado(m);
+    if (a) {
+      a.pj++;
+      a.sf += m.sets_a;
+      a.sc += m.sets_b;
+      a.jf += m.juegos_a;
+      a.jc += m.juegos_b;
+    }
+    if (b) {
+      b.pj++;
+      b.sf += m.sets_b;
+      b.sc += m.sets_a;
+      b.jf += m.juegos_b;
+      b.jc += m.juegos_a;
+    }
+    if (g === 'a') {
+      if (a) {
+        a.pg++;
+        a.puntos += 3;
+      }
+      if (b) b.pp++;
+    } else if (g === 'b') {
+      if (b) {
+        b.pg++;
+        b.puntos += 3;
+      }
+      if (a) a.pp++;
+    } else {
+      if (a) {
+        a.pe++;
+        a.puntos += 1;
+      }
+      if (b) {
+        b.pe++;
+        b.puntos += 1;
+      }
+    }
+  }
+  const arr = [...tabla.values()];
+  arr.sort(
+    (x, y) =>
+      y.puntos - x.puntos ||
+      y.sf - y.sc - (x.sf - x.sc) ||
+      y.jf - y.jc - (x.jf - x.jc) ||
+      String(x.apellidos).localeCompare(String(y.apellidos))
+  );
+  return arr.map((r, i) => ({
+    ...r,
+    pos: i + 1,
+    dif_sets: r.sf - r.sc,
+    dif_juegos: r.jf - r.jc,
+  }));
+}
+
+// Rate limit en memoria muy simple para el voto público (anti-abuso básico).
+const votoRateMap = new Map();
+function votoRateLimited(ip, max = 30, windowMs = 60_000) {
+  const now = Date.now();
+  const entry = votoRateMap.get(ip);
+  if (!entry || now - entry.start > windowMs) {
+    votoRateMap.set(ip, { start: now, count: 1 });
+    return false;
+  }
+  entry.count++;
+  return entry.count > max;
+}
+
 function mountDomainEventos(app) {
   // ——— Staff ———
-  app.get('/api/eventos/tipos', requireUser, requireAdmin, async (_req, res) => {
+  app.get('/api/eventos/tipos', requireUser, requireStaff, async (_req, res) => {
     try {
       res.json({ data: await listTipos() });
     } catch (error) {
@@ -268,7 +482,7 @@ function mountDomainEventos(app) {
     }
   });
 
-  app.get('/api/eventos/ediciones', requireUser, requireAdmin, async (_req, res) => {
+  app.get('/api/eventos/ediciones', requireUser, requireStaff, async (_req, res) => {
     try {
       res.json({ data: await listEdicionesAdmin() });
     } catch (error) {
@@ -373,7 +587,7 @@ function mountDomainEventos(app) {
   app.get(
     '/api/eventos/ediciones/:id/inscripciones',
     requireUser,
-    requireAdmin,
+    requireStaff,
     async (req, res) => {
       try {
         const id = String(req.params.id || '');
@@ -391,10 +605,178 @@ function mountDomainEventos(app) {
     }
   );
 
+  app.post(
+    '/api/eventos/ediciones/:id/inscripciones',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const edicionId = String(req.params.id || '');
+        const body = req.body || {};
+
+        const edicion = await getEdicionJoin(edicionId);
+        if (!edicion) {
+          return res.status(404).json({ error: 'Evento no encontrado' });
+        }
+
+        const nombre = String(body.nombre || '').trim();
+        const apellidos = String(body.apellidos || '').trim();
+        const telefono = normalizarTelefonoE164(
+          body.telefono || body.telefono_e164
+        );
+        const nivel = body.nivel != null ? String(body.nivel).trim() : null;
+
+        if (!nombre || !apellidos || !telefono) {
+          return res.status(400).json({
+            error: 'nombre, apellidos y teléfono válido son obligatorios',
+          });
+        }
+
+        const estado = ESTADOS_INSCRIPCION.has(String(body.estado || ''))
+          ? String(body.estado)
+          : 'confirmado';
+
+        const schema = Array.isArray(edicion.form_schema)
+          ? edicion.form_schema
+          : [];
+        const payload = {};
+        for (const field of schema) {
+          const key = field?.key;
+          if (
+            !key ||
+            key === 'nombre' ||
+            key === 'apellidos' ||
+            key === 'telefono' ||
+            key === 'nivel'
+          ) {
+            continue;
+          }
+          if (body[key] !== undefined && body[key] !== null && body[key] !== '') {
+            payload[key] = body[key];
+          }
+        }
+
+        const forzar = parseBool(body.forzar, false);
+
+        const { row, listaEspera } = await withClient(async client => {
+          await client.query('BEGIN');
+          try {
+            const result = await insertarInscripcion(
+              client,
+              edicionId,
+              { nombre, apellidos, telefono, nivel, payload, estado },
+              { forzar }
+            );
+            await client.query('COMMIT');
+            return result;
+          } catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+          }
+        });
+
+        await registrarBitacora(
+          null,
+          edicionId,
+          'inscripcion',
+          `Alta manual: ${nombre} ${apellidos}${listaEspera ? ' (lista de espera)' : ''}`,
+          { inscripcion_id: row.id, estado: row.estado },
+          req
+        );
+
+        res.status(201).json({ data: row, lista_espera: listaEspera });
+      } catch (error) {
+        console.error('[eventos] admin inscribir', error);
+        res
+          .status(error.status || 500)
+          .json({ error: error.message || 'No se pudo crear la inscripción' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/eventos/ediciones/:id/inscripciones/import',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const edicionId = String(req.params.id || '');
+        const filas = Array.isArray(req.body?.filas) ? req.body.filas : [];
+        if (!filas.length) return res.status(400).json({ error: 'No hay filas' });
+        if (filas.length > 500) {
+          return res.status(400).json({ error: 'Máximo 500 filas por importación' });
+        }
+        const existentes = await query(
+          `SELECT lower(nombre) AS n, lower(apellidos) AS a, telefono_e164 AS t
+           FROM evento_inscripciones WHERE edicion_id = $1`,
+          [edicionId]
+        );
+        const claves = new Set(
+          existentes.rows.map(r => `${r.n}|${r.a}|${r.t}`)
+        );
+        const resumen = { creados: 0, espera: 0, duplicados: 0, errores: [] };
+
+        for (let i = 0; i < filas.length; i++) {
+          const f = filas[i] || {};
+          const nombre = String(f.nombre || '').trim();
+          const apellidos = String(f.apellidos || '').trim();
+          const telefono = normalizarTelefonoE164(f.telefono);
+          if (!nombre || !apellidos || !telefono) {
+            resumen.errores.push({ fila: i + 1, error: 'Faltan nombre, apellidos o teléfono válido' });
+            continue;
+          }
+          const clave = `${nombre.toLowerCase()}|${apellidos.toLowerCase()}|${telefono}`;
+          if (claves.has(clave)) {
+            resumen.duplicados++;
+            continue;
+          }
+          try {
+            const { listaEspera } = await withClient(async client => {
+              await client.query('BEGIN');
+              try {
+                const r = await insertarInscripcion(client, edicionId, {
+                  nombre,
+                  apellidos,
+                  telefono,
+                  nivel: f.nivel ? String(f.nivel).trim() : null,
+                  payload: {},
+                  estado: 'confirmado',
+                });
+                await client.query('COMMIT');
+                return r;
+              } catch (error) {
+                await client.query('ROLLBACK');
+                throw error;
+              }
+            });
+            claves.add(clave);
+            if (listaEspera) resumen.espera++;
+            else resumen.creados++;
+          } catch (error) {
+            resumen.errores.push({ fila: i + 1, error: error.message });
+          }
+        }
+
+        await registrarBitacora(
+          null,
+          edicionId,
+          'inscripcion',
+          `Importación CSV: ${resumen.creados} altas, ${resumen.espera} en espera, ${resumen.duplicados} duplicados, ${resumen.errores.length} errores`,
+          resumen,
+          req
+        );
+        res.json({ data: resumen });
+      } catch (error) {
+        console.error('[eventos] import inscripciones', error);
+        res.status(error.status || 500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
   app.patch(
     '/api/eventos/inscripciones/:id',
     requireUser,
-    requireAdmin,
+    requireStaff,
     async (req, res) => {
       try {
         const id = String(req.params.id || '');
@@ -444,6 +826,18 @@ function mountDomainEventos(app) {
                   );
                 }
               }
+              const conImporte = await client.query(
+                `UPDATE evento_inscripciones
+                 SET importe_pagado_centimos = coalesce(
+                       importe_pagado_centimos,
+                       (SELECT precio_centimos FROM evento_ediciones WHERE id = $2)),
+                     pagado_at = coalesce(pagado_at, now())
+                 WHERE id = $1
+                 RETURNING *`,
+                [id, ins.edicion_id]
+              );
+              await client.query('COMMIT');
+              return conImporte.rows[0];
             }
             await client.query('COMMIT');
             return ins;
@@ -452,6 +846,14 @@ function mountDomainEventos(app) {
             throw error;
           }
         });
+        await registrarBitacora(
+          null,
+          row.edicion_id,
+          'estado',
+          `${row.nombre} ${row.apellidos} → ${estado}`,
+          { inscripcion_id: row.id, estado },
+          req
+        );
         res.json({ data: row });
       } catch (error) {
         console.error('[eventos] patch inscripcion', error);
@@ -637,7 +1039,7 @@ function mountDomainEventos(app) {
   });
 
   // ——— Jornadas + reservas pista ———
-  app.get('/api/eventos/pistas', requireUser, requireAdmin, async (_req, res) => {
+  app.get('/api/eventos/pistas', requireUser, requireStaff, async (_req, res) => {
     try {
       const { rows } = await query(
         `SELECT id, nombre, tipo, capacidad, precio_hora
@@ -654,7 +1056,7 @@ function mountDomainEventos(app) {
   app.get(
     '/api/eventos/ediciones/:id/jornadas',
     requireUser,
-    requireAdmin,
+    requireStaff,
     async (req, res) => {
       try {
         const id = String(req.params.id || '');
@@ -678,7 +1080,7 @@ function mountDomainEventos(app) {
   app.post(
     '/api/eventos/ediciones/:id/jornadas',
     requireUser,
-    requireAdmin,
+    requireStaff,
     async (req, res) => {
       try {
         const edicionId = String(req.params.id || '');
@@ -721,7 +1123,7 @@ function mountDomainEventos(app) {
   app.delete(
     '/api/eventos/jornadas/:id',
     requireUser,
-    requireAdmin,
+    requireStaff,
     async (req, res) => {
       try {
         const id = String(req.params.id || '');
@@ -740,7 +1142,7 @@ function mountDomainEventos(app) {
   app.get(
     '/api/eventos/ediciones/:id/reservas',
     requireUser,
-    requireAdmin,
+    requireStaff,
     async (req, res) => {
       try {
         const id = String(req.params.id || '');
@@ -763,7 +1165,7 @@ function mountDomainEventos(app) {
   app.post(
     '/api/eventos/ediciones/:id/reservas',
     requireUser,
-    requireAdmin,
+    requireStaff,
     async (req, res) => {
       try {
         const edicionId = String(req.params.id || '');
@@ -847,7 +1249,7 @@ function mountDomainEventos(app) {
   app.post(
     '/api/eventos/reservas/check',
     requireUser,
-    requireAdmin,
+    requireStaff,
     async (req, res) => {
       try {
         const body = req.body || {};
@@ -888,7 +1290,7 @@ function mountDomainEventos(app) {
   app.patch(
     '/api/eventos/reservas/:id',
     requireUser,
-    requireAdmin,
+    requireStaff,
     async (req, res) => {
       try {
         const id = String(req.params.id || '');
@@ -919,7 +1321,7 @@ function mountDomainEventos(app) {
   app.delete(
     '/api/eventos/reservas/:id',
     requireUser,
-    requireAdmin,
+    requireStaff,
     async (req, res) => {
       try {
         const id = String(req.params.id || '');
@@ -999,7 +1401,7 @@ function mountDomainEventos(app) {
   app.post(
     '/api/eventos/inscripciones/:id/pago',
     requireUser,
-    requireAdmin,
+    requireStaff,
     async (req, res) => {
       try {
         const id = String(req.params.id || '');
@@ -1017,49 +1419,62 @@ function mountDomainEventos(app) {
               err.status = 404;
               throw err;
             }
-            if (ins.estado !== 'pagado') {
-              await client.query(
-                `UPDATE evento_inscripciones
-                 SET estado = 'pagado', updated_at = now()
-                 WHERE id = $1`,
-                [id]
-              );
-            }
+            const ed = await client.query(
+              `SELECT precio_centimos FROM evento_ediciones WHERE id = $1`,
+              [ins.edicion_id]
+            );
+            const importe =
+              parsePrecioCentimos(
+                body.cantidad_centimos ??
+                  (body.cantidad_euros != null && body.cantidad_euros !== ''
+                    ? Math.round(Number(body.cantidad_euros) * 100)
+                    : null)
+              ) ??
+              ins.importe_pagado_centimos ??
+              ed.rows[0]?.precio_centimos ??
+              0;
+            const metodo = body.metodo
+              ? String(body.metodo).trim().slice(0, 40)
+              : ins.metodo_pago || null;
+            await client.query(
+              `UPDATE evento_inscripciones
+               SET estado = 'pagado',
+                   importe_pagado_centimos = $2,
+                   metodo_pago = $3,
+                   pagado_at = coalesce(pagado_at, now()),
+                   updated_at = now()
+               WHERE id = $1`,
+              [id, importe, metodo]
+            );
             const exists = await client.query(
               `SELECT id FROM evento_movimientos
                WHERE inscripcion_id = $1 AND origen = 'inscripcion' LIMIT 1`,
               [id]
             );
             let movimiento = exists.rows[0] || null;
-            if (!movimiento) {
-              const ed = await client.query(
-                `SELECT precio_centimos FROM evento_ediciones WHERE id = $1`,
-                [ins.edicion_id]
+            if (movimiento) {
+              const upd = await client.query(
+                `UPDATE evento_movimientos SET cantidad_centimos = $2
+                 WHERE id = $1 RETURNING *`,
+                [movimiento.id, importe]
               );
-              const precio =
-                parsePrecioCentimos(
-                  body.cantidad_centimos ??
-                    (body.cantidad_euros != null
-                      ? Number(body.cantidad_euros) * 100
-                      : null)
-                ) ?? ed.rows[0]?.precio_centimos;
-              if (precio != null && precio > 0) {
-                const inserted = await client.query(
-                  `INSERT INTO evento_movimientos
-                     (edicion_id, tipo, concepto, cantidad_centimos, fecha,
-                      origen, inscripcion_id, impacto_instalaciones)
-                   VALUES ($1,'ingreso',$2,$3,current_date,'inscripcion',$4,true)
-                   RETURNING *`,
-                  [
-                    ins.edicion_id,
-                    body.concepto ||
-                      `Inscripción ${ins.nombre} ${ins.apellidos}`.trim(),
-                    precio,
-                    ins.id,
-                  ]
-                );
-                movimiento = inserted.rows[0];
-              }
+              movimiento = upd.rows[0];
+            } else if (importe > 0) {
+              const inserted = await client.query(
+                `INSERT INTO evento_movimientos
+                   (edicion_id, tipo, concepto, cantidad_centimos, fecha,
+                    origen, inscripcion_id, impacto_instalaciones)
+                 VALUES ($1,'ingreso',$2,$3,current_date,'inscripcion',$4,true)
+                 RETURNING *`,
+                [
+                  ins.edicion_id,
+                  body.concepto ||
+                    `Inscripción ${ins.nombre} ${ins.apellidos}`.trim(),
+                  importe,
+                  ins.id,
+                ]
+              );
+              movimiento = inserted.rows[0];
             }
             const updated = await client.query(
               `SELECT * FROM evento_inscripciones WHERE id = $1`,
@@ -1072,10 +1487,523 @@ function mountDomainEventos(app) {
             throw error;
           }
         });
+        const ins = row.inscripcion;
+        await registrarBitacora(
+          null,
+          ins.edicion_id,
+          'pago',
+          `Pago de ${ins.nombre} ${ins.apellidos}: ${formatEuros(ins.importe_pagado_centimos)}${ins.metodo_pago ? ` (${ins.metodo_pago})` : ''}`,
+          {
+            inscripcion_id: ins.id,
+            importe_centimos: ins.importe_pagado_centimos,
+            metodo: ins.metodo_pago,
+          },
+          req
+        );
         res.json({ data: row });
       } catch (error) {
         console.error('[eventos] pago inscripcion', error);
         res.status(error.status || 500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  app.delete(
+    '/api/eventos/inscripciones/:id/pago',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const id = String(req.params.id || '');
+        const row = await withClient(async client => {
+          await client.query('BEGIN');
+          try {
+            const updated = await client.query(
+              `UPDATE evento_inscripciones
+               SET estado = CASE WHEN estado = 'pagado' THEN 'confirmado' ELSE estado END,
+                   importe_pagado_centimos = NULL,
+                   metodo_pago = NULL,
+                   pagado_at = NULL,
+                   updated_at = now()
+               WHERE id = $1
+               RETURNING *`,
+              [id]
+            );
+            if (!updated.rows[0]) {
+              const err = new Error('Inscripción no encontrada');
+              err.status = 404;
+              throw err;
+            }
+            await client.query(
+              `DELETE FROM evento_movimientos
+               WHERE inscripcion_id = $1 AND origen = 'inscripcion'`,
+              [id]
+            );
+            await client.query('COMMIT');
+            return updated.rows[0];
+          } catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+          }
+        });
+        await registrarBitacora(
+          null,
+          row.edicion_id,
+          'pago',
+          `Pago anulado de ${row.nombre} ${row.apellidos}`,
+          { inscripcion_id: row.id },
+          req
+        );
+        res.json({ data: row });
+      } catch (error) {
+        console.error('[eventos] anular pago', error);
+        res.status(error.status || 500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  // ——— Bitácora del evento ———
+  app.get(
+    '/api/eventos/ediciones/:id/bitacora',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const { rows } = await query(
+          `SELECT * FROM evento_bitacora
+           WHERE edicion_id = $1
+           ORDER BY created_at DESC
+           LIMIT 500`,
+          [String(req.params.id || '')]
+        );
+        res.json({ data: rows });
+      } catch (error) {
+        console.error('[eventos] bitacora get', error);
+        res.status(500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/eventos/ediciones/:id/bitacora',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const edicionId = String(req.params.id || '');
+        const descripcion = String(req.body?.descripcion || '').trim();
+        if (!descripcion) return res.status(400).json({ error: 'Escribe la nota' });
+        const tipo = req.body?.tipo === 'incidencia' ? 'incidencia' : 'nota';
+        const { rows } = await query(
+          `INSERT INTO evento_bitacora
+             (edicion_id, tipo, descripcion, actor_email, actor_rol)
+           VALUES ($1,$2,$3,$4,$5)
+           RETURNING *`,
+          [edicionId, tipo, descripcion.slice(0, 2000), req.user?.email || null, req.user?.rol || null]
+        );
+        res.status(201).json({ data: rows[0] });
+      } catch (error) {
+        console.error('[eventos] bitacora post', error);
+        res.status(error.code === '23503' ? 400 : 500).json({
+          error: error.message || 'Error',
+        });
+      }
+    }
+  );
+
+  // ——— Resultados + clasificación ———
+  app.get(
+    '/api/eventos/ediciones/:id/resultados',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const id = String(req.params.id || '');
+        const { rows } = await query(
+          `SELECT r.*,
+                  ia.nombre AS a_nombre, ia.apellidos AS a_apellidos,
+                  ib.nombre AS b_nombre, ib.apellidos AS b_apellidos
+           FROM evento_resultados r
+           JOIN evento_inscripciones ia ON ia.id = r.inscripcion_a
+           JOIN evento_inscripciones ib ON ib.id = r.inscripcion_b
+           WHERE r.edicion_id = $1
+           ORDER BY r.created_at DESC`,
+          [id]
+        );
+        res.json({ data: rows });
+      } catch (error) {
+        console.error('[eventos] resultados', error);
+        res.status(500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/eventos/ediciones/:id/resultados',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const edicionId = String(req.params.id || '');
+        const body = req.body || {};
+        const a = String(body.inscripcion_a || '');
+        const b = String(body.inscripcion_b || '');
+        if (!a || !b || a === b) {
+          return res.status(400).json({ error: 'Elige dos inscritos distintos' });
+        }
+        const toInt = v => {
+          const n = Math.trunc(Number(v));
+          return Number.isFinite(n) && n >= 0 ? n : 0;
+        };
+        const setsA = toInt(body.sets_a);
+        const setsB = toInt(body.sets_b);
+        const walkover = parseBool(body.walkover, false);
+        let ganador = ['a', 'b', 'empate'].includes(body.ganador)
+          ? body.ganador
+          : null;
+        if (!ganador) {
+          ganador = setsA > setsB ? 'a' : setsB > setsA ? 'b' : 'empate';
+        }
+        const { rows } = await query(
+          `INSERT INTO evento_resultados
+             (edicion_id, jornada_id, inscripcion_a, inscripcion_b,
+              sets_a, sets_b, juegos_a, juegos_b, walkover, ganador, notas)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           RETURNING *`,
+          [
+            edicionId,
+            body.jornada_id ? String(body.jornada_id) : null,
+            a,
+            b,
+            setsA,
+            setsB,
+            toInt(body.juegos_a),
+            toInt(body.juegos_b),
+            walkover,
+            ganador,
+            body.notas ? String(body.notas).trim() : null,
+          ]
+        );
+        const nombres = await query(
+          `SELECT id, nombre, apellidos FROM evento_inscripciones WHERE id = ANY($1::uuid[])`,
+          [[a, b]]
+        );
+        const nom = idIns => {
+          const r = nombres.rows.find(x => x.id === idIns);
+          return r ? `${r.nombre} ${r.apellidos}` : '?';
+        };
+        await registrarBitacora(
+          null,
+          edicionId,
+          'resultado',
+          `Resultado: ${nom(a)} ${setsA}–${setsB} ${nom(b)}${walkover ? ' (W.O.)' : ''}`,
+          { resultado_id: rows[0].id },
+          req
+        );
+        res.status(201).json({ data: rows[0] });
+      } catch (error) {
+        console.error('[eventos] crear resultado', error);
+        res.status(error.code === '23503' ? 400 : 500).json({
+          error: error.message || 'Error',
+        });
+      }
+    }
+  );
+
+  app.delete(
+    '/api/eventos/resultados/:id',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const { rows } = await query(
+          `DELETE FROM evento_resultados WHERE id = $1 RETURNING edicion_id, sets_a, sets_b`,
+          [String(req.params.id || '')]
+        );
+        if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+        await registrarBitacora(
+          null,
+          rows[0].edicion_id,
+          'resultado',
+          `Resultado borrado (${rows[0].sets_a}–${rows[0].sets_b})`,
+          {},
+          req
+        );
+        res.json({ ok: true });
+      } catch (error) {
+        console.error('[eventos] borrar resultado', error);
+        res.status(500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  app.get(
+    '/api/eventos/ediciones/:id/clasificacion',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const tabla = await computarClasificacion(String(req.params.id || ''));
+        res.json({ data: tabla });
+      } catch (error) {
+        console.error('[eventos] clasificacion', error);
+        res.status(500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  // ——— Votaciones (QR premios) ———
+  app.get(
+    '/api/eventos/ediciones/:id/votaciones',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const id = String(req.params.id || '');
+        const { rows } = await query(
+          `SELECT v.*,
+                  (SELECT count(*)::int FROM evento_votacion_opciones o
+                    WHERE o.votacion_id = v.id) AS opciones_count,
+                  (SELECT count(*)::int FROM evento_votos t
+                    WHERE t.votacion_id = v.id) AS votos_count
+           FROM evento_votaciones v
+           WHERE v.edicion_id = $1
+           ORDER BY v.created_at DESC`,
+          [id]
+        );
+        res.json({ data: rows });
+      } catch (error) {
+        console.error('[eventos] votaciones', error);
+        res.status(500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/eventos/ediciones/:id/votaciones',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const edicionId = String(req.params.id || '');
+        const body = req.body || {};
+        const titulo = String(body.titulo || '').trim();
+        if (!titulo) return res.status(400).json({ error: 'Título obligatorio' });
+        const opciones = Array.isArray(body.opciones)
+          ? body.opciones
+              .map(o => ({
+                etiqueta: String(o?.etiqueta || '').trim(),
+                inscripcion_id: o?.inscripcion_id
+                  ? String(o.inscripcion_id)
+                  : null,
+              }))
+              .filter(o => o.etiqueta)
+          : [];
+        if (opciones.length < 2) {
+          return res.status(400).json({ error: 'Añade al menos 2 opciones' });
+        }
+        const row = await withClient(async client => {
+          await client.query('BEGIN');
+          try {
+            const v = await client.query(
+              `INSERT INTO evento_votaciones (edicion_id, titulo, descripcion, token)
+               VALUES ($1,$2,$3,$4) RETURNING *`,
+              [
+                edicionId,
+                titulo,
+                body.descripcion ? String(body.descripcion).trim() : null,
+                nuevoToken(),
+              ]
+            );
+            const votacion = v.rows[0];
+            for (let i = 0; i < opciones.length; i++) {
+              await client.query(
+                `INSERT INTO evento_votacion_opciones
+                   (votacion_id, etiqueta, inscripcion_id, orden)
+                 VALUES ($1,$2,$3,$4)`,
+                [votacion.id, opciones[i].etiqueta, opciones[i].inscripcion_id, i]
+              );
+            }
+            await client.query('COMMIT');
+            return votacion;
+          } catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+          }
+        });
+        await registrarBitacora(
+          null,
+          edicionId,
+          'votacion',
+          `Votación creada: ${titulo} (${opciones.length} opciones)`,
+          { votacion_id: row.id },
+          req
+        );
+        res.status(201).json({ data: row });
+      } catch (error) {
+        console.error('[eventos] crear votacion', error);
+        res.status(500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  app.patch(
+    '/api/eventos/votaciones/:id',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const id = String(req.params.id || '');
+        const body = req.body || {};
+        const fields = [];
+        const params = [];
+        if (body.abierta !== undefined) {
+          params.push(parseBool(body.abierta, true));
+          fields.push(`abierta = $${params.length}`);
+        }
+        if (body.titulo !== undefined) {
+          params.push(String(body.titulo).trim());
+          fields.push(`titulo = $${params.length}`);
+        }
+        if (body.descripcion !== undefined) {
+          params.push(body.descripcion ? String(body.descripcion).trim() : null);
+          fields.push(`descripcion = $${params.length}`);
+        }
+        if (!fields.length) return res.status(400).json({ error: 'Nada que actualizar' });
+        params.push(id);
+        const { rows } = await query(
+          `UPDATE evento_votaciones SET ${fields.join(', ')}, updated_at = now()
+           WHERE id = $${params.length} RETURNING *`,
+          params
+        );
+        if (!rows[0]) return res.status(404).json({ error: 'No encontrada' });
+        if (body.abierta !== undefined) {
+          await registrarBitacora(
+            null,
+            rows[0].edicion_id,
+            'votacion',
+            `Votación ${rows[0].abierta ? 'abierta' : 'cerrada'}: ${rows[0].titulo}`,
+            { votacion_id: rows[0].id },
+            req
+          );
+        }
+        res.json({ data: rows[0] });
+      } catch (error) {
+        console.error('[eventos] patch votacion', error);
+        res.status(500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  app.delete(
+    '/api/eventos/votaciones/:id',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const { rows } = await query(
+          `DELETE FROM evento_votaciones WHERE id = $1 RETURNING edicion_id, titulo`,
+          [String(req.params.id || '')]
+        );
+        if (!rows[0]) return res.status(404).json({ error: 'No encontrada' });
+        await registrarBitacora(
+          null,
+          rows[0].edicion_id,
+          'votacion',
+          `Votación eliminada: ${rows[0].titulo}`,
+          {},
+          req
+        );
+        res.json({ ok: true });
+      } catch (error) {
+        console.error('[eventos] borrar votacion', error);
+        res.status(500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  app.get(
+    '/api/eventos/votaciones/:id/resultados',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const id = String(req.params.id || '');
+        const { rows } = await query(
+          `SELECT o.id, o.etiqueta, o.orden,
+                  (SELECT count(*)::int FROM evento_votos t WHERE t.opcion_id = o.id) AS votos
+           FROM evento_votacion_opciones o
+           WHERE o.votacion_id = $1
+           ORDER BY votos DESC, o.orden ASC`,
+          [id]
+        );
+        const total = rows.reduce((s, r) => s + r.votos, 0);
+        res.json({ data: { opciones: rows, total } });
+      } catch (error) {
+        console.error('[eventos] resultados votacion', error);
+        res.status(500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/eventos/ediciones/:id/votacion-qr',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const edicionId = String(req.params.id || '');
+        const regenerar = parseBool(req.body?.regenerar, false);
+        const cur = await query(
+          `SELECT votacion_token FROM evento_ediciones WHERE id = $1`,
+          [edicionId]
+        );
+        if (!cur.rows[0]) return res.status(404).json({ error: 'Evento no encontrado' });
+        let token = cur.rows[0].votacion_token;
+        if (!token || regenerar) {
+          token = nuevoToken();
+          await query(
+            `UPDATE evento_ediciones SET votacion_token = $2, updated_at = now() WHERE id = $1`,
+            [edicionId, token]
+          );
+          await registrarBitacora(
+            null,
+            edicionId,
+            'votacion',
+            regenerar
+              ? 'QR de votación regenerado (el anterior deja de funcionar)'
+              : 'QR de votación generado',
+            {},
+            req
+          );
+        }
+        res.json({ data: { token } });
+      } catch (error) {
+        console.error('[eventos] votacion qr', error);
+        res.status(500).json({ error: error.message || 'Error' });
+      }
+    }
+  );
+
+  app.get(
+    '/api/eventos/votaciones/:id/votos',
+    requireUser,
+    requireStaff,
+    async (req, res) => {
+      try {
+        const { rows } = await query(
+          `SELECT t.id, t.votante_nombre, t.votante_telefono, t.created_at,
+                  o.etiqueta AS opcion
+           FROM evento_votos t
+           JOIN evento_votacion_opciones o ON o.id = t.opcion_id
+           WHERE t.votacion_id = $1
+           ORDER BY t.created_at DESC`,
+          [String(req.params.id || '')]
+        );
+        res.json({ data: rows });
+      } catch (error) {
+        console.error('[eventos] votos', error);
+        res.status(500).json({ error: error.message || 'Error' });
       }
     }
   );
@@ -1189,53 +2117,179 @@ function mountDomainEventos(app) {
         return res.status(400).json({ error: 'nivel es obligatorio' });
       }
 
-      const row = await withClient(async client => {
+      const { row, listaEspera } = await withClient(async client => {
         await client.query('BEGIN');
         try {
-          const lock = await client.query(
-            `SELECT id, aforo, inscripcion_abierta
-             FROM evento_ediciones WHERE id = $1 FOR UPDATE`,
-            [edicionId]
-          );
-          const ed = lock.rows[0];
-          if (!ed?.inscripcion_abierta) {
-            const err = new Error('Inscripción cerrada');
-            err.status = 403;
-            throw err;
-          }
-          if (ed.aforo != null) {
-            const count = await client.query(
-              `SELECT count(*)::int AS n FROM evento_inscripciones
-               WHERE edicion_id = $1 AND estado <> 'rechazado'`,
-              [edicionId]
-            );
-            if (count.rows[0].n >= ed.aforo) {
-              const err = new Error('Aforo completo');
-              err.status = 409;
-              throw err;
-            }
-          }
-          const inserted = await client.query(
-            `INSERT INTO evento_inscripciones
-               (edicion_id, nombre, apellidos, telefono_e164, nivel, payload)
-             VALUES ($1,$2,$3,$4,$5,$6)
-             RETURNING id, created_at, estado`,
-            [edicionId, nombre, apellidos, telefono, nivel, JSON.stringify(payload)]
+          const result = await insertarInscripcion(
+            client,
+            edicionId,
+            { nombre, apellidos, telefono, nivel, payload, estado: 'nuevo' },
+            { requireAbierta: true }
           );
           await client.query('COMMIT');
-          return inserted.rows[0];
+          return result;
         } catch (error) {
           await client.query('ROLLBACK');
           throw error;
         }
       });
 
-      res.status(201).json({ data: row });
+      await registrarBitacora(
+        null,
+        edicionId,
+        'inscripcion',
+        `Inscripción web: ${nombre} ${apellidos}${listaEspera ? ' (lista de espera)' : ''}`,
+        { inscripcion_id: row.id },
+        {}
+      );
+
+      res.status(201).json({
+        data: { id: row.id, created_at: row.created_at, estado: row.estado },
+        lista_espera: listaEspera,
+      });
     } catch (error) {
       console.error('[eventos] public inscribir', error);
       res.status(error.status || 500).json({
         error: error.status ? error.message : 'No se pudo registrar la inscripción',
       });
+    }
+  });
+
+  // Ranking público de una edición publicada.
+  app.get('/api/public/eventos/:id/clasificacion', async (req, res) => {
+    try {
+      const id = String(req.params.id || '');
+      const ed = await query(
+        `SELECT id, nombre, publicado FROM evento_ediciones WHERE id = $1`,
+        [id]
+      );
+      if (!ed.rows[0] || !ed.rows[0].publicado) {
+        return res.status(404).json({ error: 'No disponible' });
+      }
+      const tabla = await computarClasificacion(id);
+      // En público solo exponemos nombre + inicial del apellido.
+      const data = tabla.map(r => ({
+        pos: r.pos,
+        nombre: r.nombre,
+        apellido_inicial: r.apellidos ? `${String(r.apellidos).charAt(0)}.` : '',
+        pj: r.pj,
+        pg: r.pg,
+        pe: r.pe,
+        pp: r.pp,
+        dif_sets: r.dif_sets,
+        dif_juegos: r.dif_juegos,
+        puntos: r.puntos,
+      }));
+      res.json({ data: { edicion: ed.rows[0].nombre, tabla: data } });
+    } catch (error) {
+      console.error('[eventos] public clasificacion', error);
+      res.status(500).json({ error: 'Error' });
+    }
+  });
+
+  // Votación pública del evento (token del QR de la edición).
+  app.get('/api/public/votaciones/:token', async (req, res) => {
+    try {
+      const token = String(req.params.token || '');
+      const ed = await query(
+        `SELECT id, nombre FROM evento_ediciones WHERE votacion_token = $1`,
+        [token]
+      );
+      const edicion = ed.rows[0];
+      if (!edicion) {
+        return res.status(404).json({ error: 'Este QR no es válido o ha sido regenerado' });
+      }
+      const vs = await query(
+        `SELECT id, titulo, descripcion FROM evento_votaciones
+         WHERE edicion_id = $1 AND abierta = true
+         ORDER BY created_at ASC`,
+        [edicion.id]
+      );
+      const ids = vs.rows.map(v => v.id);
+      const ops = ids.length
+        ? await query(
+            `SELECT id, votacion_id, etiqueta, orden FROM evento_votacion_opciones
+             WHERE votacion_id = ANY($1::uuid[]) ORDER BY orden ASC`,
+            [ids]
+          )
+        : { rows: [] };
+      res.json({
+        data: {
+          edicion: edicion.nombre,
+          votaciones: vs.rows.map(v => ({
+            ...v,
+            opciones: ops.rows
+              .filter(o => o.votacion_id === v.id)
+              .map(o => ({ id: o.id, etiqueta: o.etiqueta })),
+          })),
+        },
+      });
+    } catch (error) {
+      console.error('[eventos] public votacion get', error);
+      res.status(500).json({ error: 'Error' });
+    }
+  });
+
+  app.post('/api/public/votaciones/:token/voto', async (req, res) => {
+    try {
+      const ip =
+        (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim() ||
+        req.ip ||
+        'anon';
+      if (votoRateLimited(ip)) {
+        return res.status(429).json({ error: 'Demasiados votos, inténtalo luego' });
+      }
+      const token = String(req.params.token || '');
+      const body = req.body || {};
+      const nombre = String(body.nombre || '').trim().slice(0, 120);
+      const telefono = normalizarTelefonoE164(body.telefono);
+      if (!nombre || !telefono) {
+        return res.status(400).json({ error: 'Pon tu nombre y un teléfono válido' });
+      }
+      const votos = Array.isArray(body.votos) ? body.votos : [];
+      if (!votos.length) return res.status(400).json({ error: 'Elige al menos una opción' });
+
+      const ed = await query(
+        `SELECT id FROM evento_ediciones WHERE votacion_token = $1`,
+        [token]
+      );
+      const edicion = ed.rows[0];
+      if (!edicion) {
+        return res.status(404).json({ error: 'Este QR no es válido o ha sido regenerado' });
+      }
+
+      const registrados = [];
+      const yaVotados = [];
+      for (const v of votos.slice(0, 50)) {
+        const votacionId = String(v?.votacion_id || '');
+        const opcionId = String(v?.opcion_id || '');
+        const ok = await query(
+          `SELECT o.id FROM evento_votacion_opciones o
+           JOIN evento_votaciones vt ON vt.id = o.votacion_id
+           WHERE o.id = $1 AND vt.id = $2 AND vt.edicion_id = $3 AND vt.abierta = true`,
+          [opcionId, votacionId, edicion.id]
+        );
+        if (!ok.rows[0]) continue;
+        const ins = await query(
+          `INSERT INTO evento_votos
+             (votacion_id, opcion_id, huella, votante_nombre, votante_telefono)
+           VALUES ($1,$2,$3,$4,$5)
+           ON CONFLICT (votacion_id, huella) DO NOTHING
+           RETURNING id`,
+          [votacionId, opcionId, telefono, nombre, telefono]
+        );
+        if (ins.rows[0]) registrados.push(votacionId);
+        else yaVotados.push(votacionId);
+      }
+      if (!registrados.length && !yaVotados.length) {
+        return res.status(400).json({ error: 'Las votaciones elegidas ya no están abiertas' });
+      }
+      res.status(201).json({
+        data: { registrados: registrados.length, ya_votados: yaVotados },
+      });
+    } catch (error) {
+      console.error('[eventos] public voto', error);
+      res.status(500).json({ error: 'No se pudo registrar el voto' });
     }
   });
 }

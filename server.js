@@ -55,7 +55,10 @@ app.use((req, res, next) => {
   if (
     req.path.startsWith('/h/') ||
     req.path.startsWith('/p/') ||
-    req.path.startsWith('/api/familia')
+    req.path.startsWith('/v/') ||
+    req.path.startsWith('/r/') ||
+    req.path.startsWith('/api/familia') ||
+    req.path.startsWith('/api/public/votaciones')
   ) {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -126,6 +129,7 @@ app.use('/api/auth/login', rateLimit({ windowMs: 60_000, max: 20 }));
 // Público con token en URL: límite más bajo por IP (vista previa WA + abuso).
 app.use('/api/familia', rateLimit({ windowMs: 60_000, max: 30 }));
 app.use('/api/public/eventos', rateLimit({ windowMs: 60_000, max: 60 }));
+app.use('/api/public/votaciones', rateLimit({ windowMs: 60_000, max: 60 }));
 app.use('/api/public/carteles', rateLimit({ windowMs: 60_000, max: 120 }));
 mountAuth(app);
 mountProfesoresAuth(app);

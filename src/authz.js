@@ -15,6 +15,16 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
+function requireStaff(req, res, next) {
+  const session = getSession(req);
+  if (!session) return res.status(401).json({ error: 'No autenticado' });
+  if (session.rol !== 'admin' && session.rol !== 'profesor') {
+    return res.status(403).json({ error: 'Sin rol válido en el CRM' });
+  }
+  req.user = session;
+  return next();
+}
+
 /** Tablas/ops permitidas a rol profesor en /api/query. */
 const TABLAS_PROFESOR = new Set([
   'clases', 'eventos_clase', 'asistencias', 'ejercicios', 'profesores',
@@ -33,6 +43,7 @@ function profesorPuede(table, op) {
 
 module.exports = {
   requireAdmin,
+  requireStaff,
   roleFromClaims,
   TABLAS_PROFESOR,
   ESCRITURA_PROFESOR,
