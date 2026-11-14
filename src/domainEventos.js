@@ -65,21 +65,61 @@ function normalizeConfig(raw) {
     ? src.gastos.map(normalizeLinea).filter(Boolean)
     : [];
   return {
-    escenarios: { aforo_pct: aforoPct },
+    escenarios: {
+      aforo_pct: aforoPct,
+      jugadores_previstos: numeroOpcional(escenariosIn.jugadores_previstos, 0, 1000),
+    },
     ingresos,
     gastos,
+    calculadora: normalizeCalculadora(src.calculadora),
   };
+}
+
+function numeroOpcional(raw, min, max) {
+  if (raw == null || raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min) return null;
+  return Math.min(max, n);
+}
+
+/** Datos de la calculadora de rentabilidad, para volver a abrirla como se dejó. */
+function normalizeCalculadora(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const entero = v => {
+    const n = numeroOpcional(v, 0, 1000);
+    return n == null ? null : Math.round(n);
+  };
+  return {
+    franja: raw.franja === 'manana_finde' ? 'manana_finde' : 'tarde_finde',
+    con_picoteo: Boolean(raw.con_picoteo),
+    coste_picoteo_euros: numeroOpcional(raw.coste_picoteo_euros, 0, 10000),
+    jugadores: entero(raw.jugadores),
+    pistas_fijas: entero(raw.pistas_fijas),
+    margen_pct: numeroOpcional(raw.margen_pct, 0, 100),
+    precio_final_euros: numeroOpcional(raw.precio_final_euros, 0, 10000),
+    alquiler_pista_euros: numeroOpcional(raw.alquiler_pista_euros, 0, 10000),
+  };
+}
+
+/** Jugadores con los que se multiplican las líneas variables. */
+function jugadoresBase(config, aforo) {
+  if (config.escenarios.jugadores_previstos != null) {
+    return Math.round(config.escenarios.jugadores_previstos);
+  }
+  const aforoBase =
+    aforo != null && Number.isFinite(Number(aforo)) ? Number(aforo) : 0;
+  return Math.round(aforoBase * ((config.escenarios.aforo_pct || 100) / 100));
 }
 
 function proyectarConfig(configRaw, aforo) {
   const config = normalizeConfig(configRaw);
   const aforoBase =
     aforo != null && Number.isFinite(Number(aforo)) ? Number(aforo) : 0;
-  const factor = (config.escenarios.aforo_pct || 100) / 100;
+  const base = jugadoresBase(config, aforo);
   const proyectarLineas = lineas =>
     lineas.map(l => {
       const unidadesEfectivas = l.variable
-        ? Math.round(l.unidades * aforoBase * factor)
+        ? Math.round(l.unidades * base)
         : l.unidades;
       const total_centimos = Math.round(l.precio_centimos * unidadesEfectivas);
       return { ...l, unidades_efectivas: unidadesEfectivas, total_centimos };
@@ -91,6 +131,7 @@ function proyectarConfig(configRaw, aforo) {
   return {
     aforo_base: aforoBase,
     aforo_pct: config.escenarios.aforo_pct,
+    jugadores_base: base,
     ingresos,
     gastos,
     total_ingresos_centimos: totalIngresos,
@@ -879,7 +920,7 @@ function mountDomainEventos(app) {
             edicion_id: rows[0].id,
             aforo: rows[0].aforo,
             precio_centimos: rows[0].precio_centimos,
-            config: rows[0].config_pyl || {},
+            config: normalizeConfig(rows[0].config_pyl),
             proyeccion: proyectarConfig(rows[0].config_pyl, rows[0].aforo),
           },
         });
@@ -911,7 +952,7 @@ function mountDomainEventos(app) {
             edicion_id: rows[0].id,
             aforo: rows[0].aforo,
             precio_centimos: rows[0].precio_centimos,
-            config: rows[0].config_pyl,
+            config: normalizeConfig(rows[0].config_pyl),
             proyeccion: proyectarConfig(rows[0].config_pyl, rows[0].aforo),
           },
         });
