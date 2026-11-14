@@ -206,7 +206,7 @@ const WRITABLE_COLUMNS = {
   pagos: new Set([
     'id', 'alumno_id', 'cantidad', 'mes_cubierto', 'metodo', 'fecha_pago', 'tipo_pago',
     'fecha_inicio', 'fecha_fin', 'clases_cubiertas', 'origen_registro',
-    'importacion_movimiento_id', 'huella_movimiento',
+    'importacion_movimiento_id', 'huella_movimiento', 'operacion_id',
   ]),
   pagos_clases_internas: new Set([
     'id', 'clase_id', 'fecha', 'estado', 'notas', 'created_at', 'created_by',
